@@ -1,9 +1,11 @@
+import os
+import re
+import io
 import streamlit as st
 import requests
 import pandas as pd
-import io
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 # ── Page config ───────────────────────────────────────────
 st.set_page_config(
@@ -14,28 +16,202 @@ st.set_page_config(
 )
 
 # ── Session state init ────────────────────────────────────
-for key, default in [
-    ("token", None), ("username", None), ("page", "login"),
+DEFAULTS = [
+    ("token", None),
+    ("username", None),
+    ("page", "auth"),
+    ("auth_view", "signup"),
     ("scores", {"speech": None, "hw": None, "eeg": None}),
-    ("patient_name", ""), ("patient_id", None),
-    ("last_result", None), ("history_cache", None),
-]:
+    ("patient_name", ""),
+    ("patient_id", None),
+    ("screening_mode", None),          # "single" or "cross"
+    ("selected_modalities", []),       # ["speech", "handwriting", "eeg"]
+    ("last_result", None),
+    ("history_cache", None),
+    ("history_exists", False),
+]
+
+for key, default in DEFAULTS:
     if key not in st.session_state:
         st.session_state[key] = default
 
+
+# ── Helpers ───────────────────────────────────────────────
 def auth_header():
     return {"Authorization": f"Bearer {st.session_state.token}"}
+
 
 def go(page):
     st.session_state.page = page
     st.rerun()
+
+
+def is_valid_email(email: str) -> bool:
+    email = (email or "").strip()
+    pattern = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+    return re.match(pattern, email) is not None
+
+
+def password_error(password: str, check_min: bool = True):
+    if password is None:
+        return "Password is required."
+    size = len(password.encode("utf-8"))
+    if check_min and size < 8:
+        return "Password must be at least 8 characters long."
+    if size > 72:
+        return "Password cannot be longer than 72 characters."
+    return None
+
+
+def safe_error_response(res, fallback):
+    try:
+        detail = res.json().get("detail", fallback)
+        if isinstance(detail, str):
+            return detail
+        return fallback
+    except Exception:
+        return fallback
+
+
+def login_success(data):
+    st.session_state.token = data["token"]
+    st.session_state.username = data.get("username", "User")
+    st.session_state.page = "patient_start"
+    st.session_state.auth_view = "signup"
+    st.session_state.history_cache = None
+    refresh_history_exists()
+    st.rerun()
+
+
+def refresh_history_exists():
+    if not st.session_state.token:
+        st.session_state.history_exists = False
+        return
+
+    try:
+        res = requests.get(
+            f"{BASE_URL}/history/all/mine",
+            headers=auth_header(),
+            timeout=10
+        )
+        if res.status_code == 200:
+            records = res.json()
+            st.session_state.history_cache = records
+            st.session_state.history_exists = bool(records)
+        else:
+            st.session_state.history_exists = False
+    except Exception:
+        st.session_state.history_exists = False
+
+
+def reset_patient_session(clear_last_result=True):
+    st.session_state.patient_name = ""
+    st.session_state.patient_id = None
+    st.session_state.screening_mode = None
+    st.session_state.selected_modalities = []
+    st.session_state.scores = {"speech": None, "hw": None, "eeg": None}
+    if clear_last_result:
+        st.session_state.last_result = None
+
+
+def modality_label(key):
+    return {
+        "speech": "Speech",
+        "handwriting": "Handwriting",
+        "eeg": "EEG",
+    }.get(key, key)
+
+
+def modality_icon(key):
+    return {
+        "speech": "🎙️",
+        "handwriting": "✍️",
+        "eeg": "🧠",
+    }.get(key, "•")
+
+
+def score_key_for_modality(modality):
+    return {"speech": "speech", "handwriting": "hw", "eeg": "eeg"}[modality]
+
+
+def next_uncompleted_modality():
+    for modality in st.session_state.selected_modalities:
+        skey = score_key_for_modality(modality)
+        if st.session_state.scores.get(skey) is None:
+            return modality
+    return None
+
+
+def completed_selected_count():
+    count = 0
+    for modality in st.session_state.selected_modalities:
+        skey = score_key_for_modality(modality)
+        if st.session_state.scores.get(skey) is not None:
+            count += 1
+    return count
+
+
+def selected_tests_complete():
+    selected = st.session_state.selected_modalities
+    if not selected:
+        return False
+    return completed_selected_count() == len(selected)
+
+
+def route_after_test_success():
+    nxt = next_uncompleted_modality()
+    if nxt:
+        if st.button(
+            f"Continue to {modality_icon(nxt)} {modality_label(nxt)} →",
+            type="primary",
+            use_container_width=True,
+            key=f"continue_to_{nxt}"
+        ):
+            go(nxt)
+    else:
+        if st.button(
+            ("View final result →" if st.session_state.screening_mode == "single" else "View fused assessment →"),
+            type="primary",
+            use_container_width=True,
+            key="continue_to_fuse"
+        ):
+            go("fuse")
+
+
+def render_saved_score_continue(current_modality):
+    """Shows the next action after a modality score has already been saved."""
+    skey = score_key_for_modality(current_modality)
+    if st.session_state.scores.get(skey) is None:
+        return
+
+    pending = next_uncompleted_modality()
+    if pending:
+        if pending != current_modality:
+            st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
+            if st.button(
+                f"Continue to {modality_icon(pending)} {modality_label(pending)} →",
+                type="primary",
+                use_container_width=True,
+                key=f"saved_continue_to_{pending}"
+            ):
+                go(pending)
+    else:
+        st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
+        label = "View final result →" if st.session_state.screening_mode == "single" else "View fused assessment →"
+        if st.button(
+            label,
+            type="primary",
+            use_container_width=True,
+            key=f"saved_continue_to_fuse_from_{current_modality}"
+        ):
+            go("fuse")
+
 
 # ── Global CSS ────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
 
-/* ── Reset & base ── */
 *, *::before, *::after { box-sizing: border-box; }
 
 html, body, [data-testid="stApp"] {
@@ -44,12 +220,10 @@ html, body, [data-testid="stApp"] {
     color: #1A2340;
 }
 
-/* ── Hide Streamlit chrome ── */
 #MainMenu, footer, header { visibility: hidden; }
 [data-testid="stToolbar"] { display: none; }
 .block-container { padding-top: 1.5rem !important; padding-bottom: 2rem !important; }
 
-/* ── Sidebar ── */
 [data-testid="stSidebar"] {
     background: #0B1E3D !important;
     border-right: 1px solid #1E3A6E;
@@ -57,7 +231,6 @@ html, body, [data-testid="stApp"] {
 [data-testid="stSidebar"] * { color: #CBD5E8 !important; }
 [data-testid="stSidebarContent"] { padding: 0 !important; }
 
-/* ── Cards ── */
 .ns-card {
     background: #FFFFFF;
     border-radius: 16px;
@@ -69,7 +242,6 @@ html, body, [data-testid="stApp"] {
 }
 .ns-card:hover { box-shadow: 0 4px 24px rgba(11,30,61,0.1); }
 
-/* ── Stat cards ── */
 .stat-card {
     background: #FFFFFF;
     border-radius: 14px;
@@ -93,10 +265,9 @@ html, body, [data-testid="stApp"] {
     letter-spacing: 0.06em;
 }
 
-/* ── Modality cards (home) ── */
 .modality-card {
     background: #FFFFFF;
-    border-radius: 16px;
+    border-radius: 18px;
     border: 2px solid #E2E8F4;
     padding: 2rem 1.5rem;
     text-align: center;
@@ -114,7 +285,11 @@ html, body, [data-testid="stApp"] {
     opacity: 0;
     transition: opacity 0.2s;
 }
-.modality-card:hover { border-color: #1151A6; transform: translateY(-2px); box-shadow: 0 8px 24px rgba(17,81,166,0.12); }
+.modality-card:hover {
+    border-color: #1151A6;
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(17,81,166,0.12);
+}
 .modality-card:hover::before { opacity: 1; }
 .modality-icon { font-size: 2.5rem; margin-bottom: 0.75rem; }
 .modality-title { font-size: 1.05rem; font-weight: 600; color: #1A2340; margin-bottom: 0.4rem; }
@@ -131,12 +306,23 @@ html, body, [data-testid="stApp"] {
 .badge-done { background: #D1FAE5; color: #065F46; }
 .badge-pending { background: #FEF3C7; color: #92400E; }
 
-/* ── Risk badges ── */
+.choice-card {
+    background: #FFFFFF;
+    border-radius: 22px;
+    border: 2px solid #D8E4F8;
+    padding: 2rem;
+    min-height: 190px;
+    text-align: center;
+    box-shadow: 0 8px 30px rgba(11,30,61,0.06);
+}
+.choice-icon { font-size: 2.4rem; margin-bottom: 0.7rem; }
+.choice-title { font-size: 1.25rem; font-weight: 700; color: #1A2340; margin-bottom: 0.45rem; }
+.choice-desc { font-size: 0.9rem; color: #6B7A99; line-height: 1.5; }
+
 .risk-high { background: #FEE2E2; color: #991B1B; border: 1px solid #FECACA; border-radius: 8px; padding: 0.75rem 1rem; font-weight: 600; }
 .risk-moderate { background: #FEF3C7; color: #92400E; border: 1px solid #FDE68A; border-radius: 8px; padding: 0.75rem 1rem; font-weight: 600; }
 .risk-low { background: #D1FAE5; color: #065F46; border: 1px solid #A7F3D0; border-radius: 8px; padding: 0.75rem 1rem; font-weight: 600; }
 
-/* ── Score pill ── */
 .score-pill {
     display: inline-flex;
     align-items: center;
@@ -151,7 +337,6 @@ html, body, [data-testid="stApp"] {
     font-family: 'DM Mono', monospace;
 }
 
-/* ── Page header ── */
 .page-header {
     display: flex;
     align-items: center;
@@ -181,7 +366,6 @@ html, body, [data-testid="stApp"] {
     margin: 0.15rem 0 0 0;
 }
 
-/* ── Topbar ── */
 .topbar {
     display: flex;
     justify-content: space-between;
@@ -196,6 +380,7 @@ html, body, [data-testid="stApp"] {
 .topbar-left { display: flex; align-items: center; gap: 0.75rem; }
 .topbar-breadcrumb { font-size: 0.8rem; color: #6B7A99; }
 .topbar-page { font-size: 0.95rem; font-weight: 600; color: #1A2340; }
+.topbar-right { display:flex; align-items:center; gap:0.75rem; }
 .user-chip {
     display: flex;
     align-items: center;
@@ -216,7 +401,6 @@ html, body, [data-testid="stApp"] {
 }
 .user-name { font-size: 0.82rem; font-weight: 600; color: #1A2340; }
 
-/* ── Progress tracker ── */
 .progress-tracker {
     display: flex;
     align-items: center;
@@ -227,11 +411,7 @@ html, body, [data-testid="stApp"] {
     margin-bottom: 1.5rem;
     gap: 0;
 }
-.pt-step {
-    display: flex;
-    align-items: center;
-    flex: 1;
-}
+.pt-step { display: flex; align-items: center; flex: 1; }
 .pt-dot {
     width: 32px; height: 32px;
     border-radius: 50%;
@@ -250,7 +430,6 @@ html, body, [data-testid="stApp"] {
 .pt-line { flex: 1; height: 2px; background: #E2E8F4; margin: 0 0.5rem; }
 .pt-line-done { background: #6EE7B7; }
 
-/* ── Sidebar nav items ── */
 .sb-logo {
     padding: 1.5rem 1.25rem 1rem;
     border-bottom: 1px solid #1E3A6E;
@@ -302,7 +481,6 @@ html, body, [data-testid="stApp"] {
 .sb-score-done { color: #34D399 !important; }
 .sb-score-pending { color: #4B5563 !important; }
 
-/* ── Forms ── */
 .stTextInput > div > div > input,
 .stNumberInput > div > div > input {
     border-radius: 10px !important;
@@ -318,7 +496,6 @@ html, body, [data-testid="stApp"] {
     box-shadow: 0 0 0 3px rgba(17,81,166,0.1) !important;
 }
 
-/* ── Buttons ── */
 .stButton > button {
     border-radius: 10px !important;
     font-family: 'DM Sans', sans-serif !important;
@@ -343,7 +520,6 @@ html, body, [data-testid="stApp"] {
     border-color: #BFDBFE !important;
 }
 
-/* ── File uploader ── */
 [data-testid="stFileUploader"] {
     border-radius: 14px !important;
     border: 2px dashed #BFDBFE !important;
@@ -351,7 +527,6 @@ html, body, [data-testid="stApp"] {
     padding: 1rem !important;
 }
 
-/* ── Expander ── */
 .streamlit-expanderHeader {
     background: #F8FAFF !important;
     border-radius: 10px !important;
@@ -360,7 +535,6 @@ html, body, [data-testid="stApp"] {
     color: #1A2340 !important;
 }
 
-/* ── Tabs ── */
 .stTabs [data-baseweb="tab-list"] {
     gap: 0.5rem;
     background: #F1F5FD;
@@ -383,45 +557,22 @@ html, body, [data-testid="stApp"] {
     box-shadow: 0 1px 4px rgba(11,30,61,0.1) !important;
 }
 
-/* ── Divider ── */
 hr { border-color: #E2E8F4 !important; margin: 1.25rem 0 !important; }
 
-/* ── Login page ── */
-.login-wrap {
-    max-width: 440px;
-    margin: 3rem auto;
-}
-.login-header {
-    text-align: center;
-    margin-bottom: 2rem;
-}
+.login-wrap { max-width: 500px; margin: 2rem auto; }
+.login-header { text-align: center; margin-bottom: 2rem; }
 .login-logo { font-size: 3rem; margin-bottom: 0.5rem; }
 .login-title { font-size: 1.75rem; font-weight: 700; color: #1A2340; margin: 0; }
 .login-sub { font-size: 0.9rem; color: #6B7A99; margin-top: 0.35rem; }
-
-/* ── History table ── */
-.hist-row {
-    background: #FFFFFF;
-    border-radius: 12px;
-    border: 1px solid #E2E8F4;
-    padding: 1rem 1.25rem;
-    margin-bottom: 0.75rem;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    transition: box-shadow 0.15s;
-}
-.hist-row:hover { box-shadow: 0 2px 12px rgba(11,30,61,0.08); }
-.hist-name { font-weight: 600; font-size: 0.95rem; color: #1A2340; }
-.hist-date { font-size: 0.78rem; color: #9CA3AF; margin-top: 0.15rem; }
-.hist-badge {
-    padding: 0.3rem 0.8rem;
-    border-radius: 999px;
-    font-size: 0.75rem;
-    font-weight: 600;
+.auth-switch {
+    text-align:center;
+    margin-top:1.3rem;
+    padding-top:1rem;
+    border-top:1px solid #E2E8F4;
+    color:#6B7A99;
+    font-size:0.9rem;
 }
 
-/* ── Result score ring ── */
 .result-wrap { text-align: center; padding: 1.5rem; }
 .result-score-big {
     font-size: 3.5rem;
@@ -434,7 +585,6 @@ hr { border-color: #E2E8F4 !important; margin: 1.25rem 0 !important; }
 .result-score-moderate { color: #D97706; }
 .result-score-low { color: #059669; }
 
-/* ── Info box ── */
 .info-box {
     background: #EFF6FF;
     border: 1px solid #BFDBFE;
@@ -446,14 +596,6 @@ hr { border-color: #E2E8F4 !important; margin: 1.25rem 0 !important; }
     margin-bottom: 1rem;
 }
 
-/* ── Metric row ── */
-.metric-row {
-    display: flex;
-    gap: 1rem;
-    margin-bottom: 1rem;
-}
-
-/* ── Alert override ── */
 [data-testid="stAlert"] { border-radius: 10px !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -464,7 +606,6 @@ hr { border-color: #E2E8F4 !important; margin: 1.25rem 0 !important; }
 # ═══════════════════════════════════════════════════════════
 def render_sidebar():
     with st.sidebar:
-        # Logo
         st.markdown("""
         <div class="sb-logo">
             <div class="sb-logo-text">🧠 NeuroScreen</div>
@@ -473,11 +614,10 @@ def render_sidebar():
         """, unsafe_allow_html=True)
 
         if st.session_state.token is None:
-            st.markdown('<div class="sb-section-label">Navigation</div>', unsafe_allow_html=True)
-            st.markdown("Please log in to continue.", unsafe_allow_html=True)
+            st.markdown('<div class="sb-section-label">Welcome</div>', unsafe_allow_html=True)
+            st.markdown("Create an account or sign in to continue.")
             return
 
-        # User info
         uname = st.session_state.username or "User"
         initials = uname[:2].upper()
         st.markdown(f"""
@@ -488,34 +628,46 @@ def render_sidebar():
             </div>
             <div>
                 <div style="font-size:0.88rem;font-weight:600;color:#E2E8F0;">{uname}</div>
-                <div style="font-size:0.72rem;color:#64748B;">Clinician</div>
+                <div style="font-size:0.72rem;color:#64748B;">Signed in</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # Nav
         st.markdown('<div class="sb-section-label">Main Menu</div>', unsafe_allow_html=True)
 
+        if st.button("🏁  New Screening", key="nav_new_screening", use_container_width=True):
+            reset_patient_session(clear_last_result=True)
+            go("patient_start")
+
         nav_items = [
-            ("🏠", "Dashboard", "home"),
-            ("🎙️", "Speech", "speech"),
-            ("✍️", "Handwriting", "handwriting"),
-            ("🧠", "EEG", "eeg"),
-            ("📋", "Patient History", "history"),
+            ("👤", "Patient", "patient_start"),
+            ("🧪", "Screening Type", "mode_select"),
+            ("✅", "Selected Tests", "modality_select"),
         ]
+
         for icon, label, page in nav_items:
-            is_active = st.session_state.page == page
-            btn_style = "background:#1151A6;color:white;" if is_active else ""
-            if st.button(f"{icon}  {label}", key=f"nav_{page}",
-                         use_container_width=True):
+            if st.button(f"{icon}  {label}", key=f"nav_{page}", use_container_width=True):
                 go(page)
 
-        # Current patient session
-        st.markdown('<div class="sb-section-label" style="margin-top:0.5rem;">Current Session</div>',
-                    unsafe_allow_html=True)
+        if st.session_state.selected_modalities:
+            st.markdown('<div class="sb-section-label">Tests</div>', unsafe_allow_html=True)
+            for modality in st.session_state.selected_modalities:
+                if st.button(f"{modality_icon(modality)}  {modality_label(modality)}", key=f"nav_test_{modality}", use_container_width=True):
+                    go(modality)
 
+        done = completed_selected_count()
+        total = len(st.session_state.selected_modalities)
+        if total > 0:
+            if st.button("⚡  Fused Assessment", key="nav_fuse", use_container_width=True):
+                go("fuse")
+
+        if st.session_state.history_exists:
+            if st.button("📋  Patient History", key="nav_history", use_container_width=True):
+                go("history")
+
+        st.markdown('<div class="sb-section-label" style="margin-top:0.5rem;">Current Session</div>', unsafe_allow_html=True)
         scores = st.session_state.scores
-        pname  = st.session_state.patient_name or "No patient selected"
+        pname = st.session_state.patient_name or "No patient selected"
 
         def score_html(key, label, icon):
             v = scores.get(key)
@@ -531,36 +683,34 @@ def render_sidebar():
                     <span class="sb-score-val sb-score-pending">—</span>
                 </div>"""
 
+        mode_label = {
+            "single": "Singular model",
+            "cross": "Cross-modal"
+        }.get(st.session_state.screening_mode, "Not selected")
+
         st.markdown(f"""
         <div class="sb-patient-card">
             <div class="sb-patient-name">👤 {pname}</div>
+            <div style="font-size:0.76rem;color:#94A3B8;margin-bottom:0.65rem;">{mode_label}</div>
             {score_html("speech", "Speech", "🎙️")}
             {score_html("hw", "Handwriting", "✍️")}
             {score_html("eeg", "EEG", "🧠")}
         </div>
         """, unsafe_allow_html=True)
 
-        # Tests complete counter
-        done = sum(1 for v in scores.values() if v is not None)
-        if done > 0:
+        if total > 0:
             st.markdown(f"""
             <div style="margin:0 1rem 0.5rem;padding:0.65rem 0.9rem;background:#132847;border-radius:10px;
                         border:1px solid #1E3A6E;display:flex;justify-content:space-between;align-items:center;">
-                <span style="font-size:0.78rem;color:#94A3B8;">Tests complete</span>
-                <span style="font-size:0.85rem;font-weight:700;color:#34D399;">{done}/3</span>
+                <span style="font-size:0.78rem;color:#94A3B8;">Selected tests complete</span>
+                <span style="font-size:0.85rem;font-weight:700;color:#34D399;">{done}/{total}</span>
             </div>
             """, unsafe_allow_html=True)
 
-            if st.button("⚡  Get Fused Result", use_container_width=True, key="nav_fuse"):
-                go("fuse")
-
-        st.markdown("<div style='flex:1'></div>", unsafe_allow_html=True)
         st.markdown("---")
         if st.button("🚪  Logout", use_container_width=True, key="nav_logout"):
-            for k in ["token", "username", "patient_name", "patient_id", "last_result"]:
-                st.session_state[k] = None
-            st.session_state.scores  = {"speech": None, "hw": None, "eeg": None}
-            st.session_state.page    = "login"
+            for k, default in DEFAULTS:
+                st.session_state[k] = default
             st.rerun()
 
 
@@ -568,61 +718,90 @@ def render_sidebar():
 # TOPBAR
 # ═══════════════════════════════════════════════════════════
 PAGE_META = {
-    "home":        ("Dashboard", "Overview & screening tests"),
-    "speech":      ("Speech Analysis", "Voice biomarker screening"),
-    "handwriting": ("Handwriting Analysis", "Motor control screening"),
-    "eeg":         ("EEG Analysis", "Brainwave pattern screening"),
-    "fuse":        ("Fused Assessment", "Combined risk evaluation"),
-    "history":     ("Patient History", "Past screening records"),
+    "patient_start":   ("Patient Details", "Start a new screening"),
+    "mode_select":     ("Screening Type", "Choose singular or cross-modal screening"),
+    "modality_select": ("Select Modalities", "Choose the available test data"),
+    "speech":          ("Speech Analysis", "Voice biomarker screening"),
+    "handwriting":     ("Handwriting Analysis", "Motor control screening"),
+    "eeg":             ("EEG Analysis", "Brainwave pattern screening"),
+    "fuse":            ("Final Assessment", "Risk evaluation"),
+    "history":         ("Patient History", "Past screening records"),
 }
 
+
 def render_topbar():
-    page  = st.session_state.page
+    page = st.session_state.page
     title, sub = PAGE_META.get(page, ("NeuroScreen", ""))
     uname = st.session_state.username or ""
     initials = uname[:2].upper()
 
-    st.markdown(f"""
-    <div class="topbar">
-        <div class="topbar-left">
-            <span class="topbar-breadcrumb">NeuroScreen /</span>
-            <span class="topbar-page">{title}</span>
-        </div>
+    left_html = f"""
+    <div class="topbar-left">
+        <span class="topbar-breadcrumb">NeuroScreen /</span>
+        <span class="topbar-page">{title}</span>
+    </div>
+    """
+    right_html = f"""
+    <div class="topbar-right">
         <div class="user-chip">
             <div class="user-avatar">{initials}</div>
             <span class="user-name">{uname}</span>
         </div>
     </div>
-    """, unsafe_allow_html=True)
+    """
+
+    col1, col2 = st.columns([5, 2])
+    with col1:
+        st.markdown(f'<div class="topbar">{left_html}<div></div></div>', unsafe_allow_html=True)
+    with col2:
+        hcol, ucol = st.columns([1, 1.25])
+        with hcol:
+            if st.session_state.history_exists:
+                if st.button("📋 History", key=f"top_history_{page}", use_container_width=True):
+                    go("history")
+        with ucol:
+            st.markdown(f"""
+            <div style="display:flex;justify-content:flex-end;margin-top:0.1rem;">
+                <div class="user-chip" title="Signed-in account">
+                    <div class="user-avatar">{initials}</div>
+                    <span class="user-name">Account: {uname}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════
 # PROGRESS TRACKER
 # ═══════════════════════════════════════════════════════════
 def render_progress():
-    scores = st.session_state.scores
-    steps  = [
-        ("speech", "Speech", "🎙️"),
-        ("hw",     "Handwriting", "✍️"),
-        ("eeg",    "EEG", "🧠"),
-        ("fuse",   "Fused Result", "⚡"),
-    ]
-    page   = st.session_state.page
-    active_map = {"speech": 0, "handwriting": 1, "eeg": 2, "fuse": 3}
-    active_idx = active_map.get(page, -1)
+    selected = st.session_state.selected_modalities
+    if not selected:
+        return
+
+    steps = []
+    for modality in selected:
+        steps.append((score_key_for_modality(modality), modality_label(modality), modality_icon(modality), modality))
+    steps.append(("fuse", "Fused Result", "⚡", "fuse"))
+
+    page = st.session_state.page
+    active_idx = -1
+    for i, (_, _, _, page_key) in enumerate(steps):
+        if page == page_key:
+            active_idx = i
 
     parts = []
-    for i, (key, label, icon) in enumerate(steps):
-        is_done   = (key != "fuse" and scores.get(key) is not None) or \
-                    (key == "fuse" and st.session_state.last_result is not None)
-        is_active = (i == active_idx)
+    for i, (skey, label, icon, page_key) in enumerate(steps):
+        is_done = (skey != "fuse" and st.session_state.scores.get(skey) is not None) or (
+            skey == "fuse" and st.session_state.last_result is not None
+        )
+        is_active = i == active_idx
 
         if is_done:
             dot_cls = "pt-dot-done"; lbl_cls = "pt-label-done"; dot_content = "✓"
         elif is_active:
-            dot_cls = "pt-dot-active"; lbl_cls = "pt-label-active"; dot_content = str(i+1)
+            dot_cls = "pt-dot-active"; lbl_cls = "pt-label-active"; dot_content = str(i + 1)
         else:
-            dot_cls = "pt-dot-pending"; lbl_cls = "pt-label-pending"; dot_content = str(i+1)
+            dot_cls = "pt-dot-pending"; lbl_cls = "pt-label-pending"; dot_content = str(i + 1)
 
         parts.append(f"""
         <div class="pt-step">
@@ -634,8 +813,7 @@ def render_progress():
             line_cls = "pt-line-done" if is_done else "pt-line"
             parts.append(f'<div class="pt-line {line_cls}"></div>')
 
-    st.markdown(f'<div class="progress-tracker">{"".join(parts)}</div>',
-                unsafe_allow_html=True)
+    st.markdown(f'<div class="progress-tracker">{"".join(parts)}</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -643,15 +821,15 @@ def render_progress():
 # ═══════════════════════════════════════════════════════════
 def render_risk_result(p_pd, risk, label="PD Probability"):
     score_cls = {
-        "High Risk":     "result-score-high",
+        "High Risk": "result-score-high",
         "Moderate Risk": "result-score-moderate",
-        "Low Risk":      "result-score-low",
+        "Low Risk": "result-score-low",
     }.get(risk, "result-score-low")
 
     risk_cls = {
-        "High Risk":     "risk-high",
+        "High Risk": "risk-high",
         "Moderate Risk": "risk-moderate",
-        "Low Risk":      "risk-low",
+        "Low Risk": "risk-low",
     }.get(risk, "risk-low")
 
     icon = {"High Risk": "⚠️", "Moderate Risk": "⚡", "Low Risk": "✅"}.get(risk, "")
@@ -669,10 +847,10 @@ def render_risk_result(p_pd, risk, label="PD Probability"):
 
 
 # ═══════════════════════════════════════════════════════════
-# LOGIN PAGE
+# AUTH PAGE
 # ═══════════════════════════════════════════════════════════
-def show_login():
-    col_l, col_c, col_r = st.columns([1, 1.4, 1])
+def show_auth():
+    col_l, col_c, col_r = st.columns([1, 1.25, 1])
     with col_c:
         st.markdown("""
         <div class="login-header">
@@ -682,160 +860,299 @@ def show_login():
         </div>
         """, unsafe_allow_html=True)
 
-        with st.container():
-            tab1, tab2 = st.tabs(["  Sign In  ", "  Create Account  "])
+        if st.session_state.auth_view == "signup":
+            st.markdown("### Create Account")
+            username = st.text_input("Full name", placeholder="Enter your full name", key="reg_user")
+            email = st.text_input("Email address", placeholder="you@example.com", key="reg_email")
+            password = st.text_input("Password", type="password", placeholder="Minimum 8 characters", key="reg_pass")
 
-            with tab1:
-                st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-                email    = st.text_input("Email address", placeholder="you@hospital.org", key="li_email")
-                password = st.text_input("Password", type="password", placeholder="••••••••", key="li_pass")
-                st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
-                if st.button("Sign In →", use_container_width=True, type="primary", key="li_btn"):
-                    if not email or not password:
-                        st.error("Please enter your email and password.")
-                    else:
-                        with st.spinner("Signing in…"):
-                            res = requests.post(f"{BASE_URL}/auth/login",
-                                                json={"email": email, "password": password})
-                        if res.status_code == 200:
-                            d = res.json()
-                            st.session_state.token    = d["token"]
-                            st.session_state.username = d["username"]
-                            st.session_state.page     = "home"
-                            st.rerun()
-                        else:
-                            try:    st.error(res.json().get("detail", "Login failed"))
-                            except: st.error(f"Login failed ({res.status_code})")
+            if st.button("Create Account →", use_container_width=True, type="primary", key="reg_btn"):
+                username = username.strip()
+                email = email.strip().lower()
 
-            with tab2:
-                st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-                username = st.text_input("Full name", placeholder="Dr. Jane Smith", key="reg_user")
-                email    = st.text_input("Email address", placeholder="you@hospital.org", key="reg_email")
-                password = st.text_input("Password", type="password", placeholder="Min. 8 characters", key="reg_pass")
-                st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
-                if st.button("Create Account →", use_container_width=True, type="primary", key="reg_btn"):
-                    if not username or not email or not password:
-                        st.error("Please fill in all fields.")
-                    else:
-                        with st.spinner("Creating account…"):
-                            res = requests.post(f"{BASE_URL}/auth/register",
-                                                json={"username": username, "email": email, "password": password})
-                        if res.status_code == 200:
-                            st.success("Account created! Please sign in.")
-                        else:
-                            try:    st.error(res.json().get("detail", "Registration failed"))
-                            except: st.error(f"Registration failed ({res.status_code})")
+                if not username or not email or not password:
+                    st.error("Please fill in all fields.")
+                elif not is_valid_email(email):
+                    st.error("Invalid email or password.")
+                elif password_error(password, check_min=True):
+                    st.error(password_error(password, check_min=True))
+                else:
+                    with st.spinner("Creating account…"):
+                        try:
+                            res = requests.post(
+                                f"{BASE_URL}/auth/register",
+                                json={"username": username, "email": email, "password": password},
+                                timeout=20
+                            )
+
+                            if res.status_code == 200:
+                                login_res = requests.post(
+                                    f"{BASE_URL}/auth/login",
+                                    json={"email": email, "password": password},
+                                    timeout=20
+                                )
+                                if login_res.status_code == 200:
+                                    login_success(login_res.json())
+                                else:
+                                    st.success("Account created. Please sign in.")
+                                    st.session_state.auth_view = "login"
+                                    st.rerun()
+
+                            elif res.status_code == 409:
+                                st.error("An account with this email already exists. Please sign in instead.")
+                            else:
+                                detail = safe_error_response(res, f"Registration failed ({res.status_code})")
+                                if "password cannot be longer" in detail.lower():
+                                    st.error("Password cannot be longer than 72 characters.")
+                                elif "already" in detail.lower() or "duplicate" in detail.lower():
+                                    st.error("An account with this email already exists. Please sign in instead.")
+                                else:
+                                    st.error(detail)
+
+                        except requests.exceptions.ConnectionError:
+                            st.error("Could not connect to the backend. Please make sure the backend is running.")
+                        except requests.exceptions.Timeout:
+                            st.error("The backend took too long to respond. Please try again.")
+                        except Exception as e:
+                            st.error(f"Something went wrong: {e}")
+
+            st.markdown('<div class="auth-switch">Already have an account?</div>', unsafe_allow_html=True)
+            if st.button("Sign In", use_container_width=True, key="switch_to_login"):
+                st.session_state.auth_view = "login"
+                st.rerun()
+
+        else:
+            st.markdown("### Sign In")
+            email = st.text_input("Email address", placeholder="you@example.com", key="li_email")
+            password = st.text_input("Password", type="password", placeholder="Enter your password", key="li_pass")
+
+            if st.button("Sign In →", use_container_width=True, type="primary", key="li_btn"):
+                email = email.strip().lower()
+
+                if not email or not password:
+                    st.error("Invalid email or password.")
+                elif not is_valid_email(email):
+                    st.error("Invalid email or password.")
+                elif password_error(password, check_min=False):
+                    st.error("Invalid email or password.")
+                else:
+                    with st.spinner("Signing in…"):
+                        try:
+                            res = requests.post(
+                                f"{BASE_URL}/auth/login",
+                                json={"email": email, "password": password},
+                                timeout=20
+                            )
+
+                            if res.status_code == 200:
+                                login_success(res.json())
+                            else:
+                                st.error("Invalid email or password.")
+
+                        except requests.exceptions.ConnectionError:
+                            st.error("Could not connect to the backend. Please make sure the backend is running.")
+                        except requests.exceptions.Timeout:
+                            st.error("The backend took too long to respond. Please try again.")
+                        except Exception as e:
+                            st.error(f"Something went wrong: {e}")
+
+            st.markdown('<div class="auth-switch">Do not have an account?</div>', unsafe_allow_html=True)
+            if st.button("Create Account", use_container_width=True, key="switch_to_signup"):
+                st.session_state.auth_view = "signup"
+                st.rerun()
 
         st.markdown("""
         <div style="text-align:center;margin-top:2rem;font-size:0.78rem;color:#9CA3AF;">
-            NeuroScreen v1.0 · For clinical research use only
+            NeuroScreen v1.0 · For screening assistance only
         </div>
         """, unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════
-# HOME / DASHBOARD
+# PATIENT START
 # ═══════════════════════════════════════════════════════════
-def show_home():
+def show_patient_start():
     render_topbar()
 
-    # Patient name input (top of flow)
-    pname = st.session_state.patient_name
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        new_name = st.text_input(
+    col_l, col_c, col_r = st.columns([1, 1.3, 1])
+    with col_c:
+        st.markdown("""
+        <div class="ns-card" style="text-align:center;padding:2.5rem;">
+            <div style="font-size:2.8rem;margin-bottom:0.5rem;">👤</div>
+            <h2 style="margin-bottom:0.3rem;">Enter Patient Name</h2>
+            <p style="color:#6B7A99;margin-bottom:1.5rem;">
+                This name will be used to save the screening result in your account history.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        pname = st.text_input(
             "Patient Name",
-            value=pname,
-            placeholder="Enter patient name before starting tests…",
-            key="home_pname",
-            label_visibility="collapsed"
+            value=st.session_state.patient_name,
+            placeholder="Enter patient name",
+            key="patient_name_input"
         )
-        if new_name != pname:
-            st.session_state.patient_name = new_name
-    with col2:
-        if not st.session_state.patient_name:
-            st.markdown("""
-            <div style="padding:0.5rem 0;font-size:0.82rem;color:#D97706;">
-                ⚠️ Enter patient name first
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div style="padding:0.5rem 0;font-size:0.82rem;color:#059669;">
-                ✓ Patient: <b>{st.session_state.patient_name}</b>
-            </div>
-            """, unsafe_allow_html=True)
 
-    # Stats row
-    scores = st.session_state.scores
-    done   = sum(1 for v in scores.values() if v is not None)
-    c1, c2, c3, c4 = st.columns(4)
-    stats = [
-        (c1, str(done), "Tests Complete"),
-        (c2, f"{scores['speech']:.3f}" if scores['speech'] else "—", "Speech Score"),
-        (c3, f"{scores['hw']:.3f}"     if scores['hw']     else "—", "Handwriting Score"),
-        (c4, f"{scores['eeg']:.3f}"    if scores['eeg']    else "—", "EEG Score"),
-    ]
-    for col, num, label in stats:
-        with col:
-            st.markdown(f"""
-            <div class="stat-card">
-                <div class="stat-num">{num}</div>
-                <div class="stat-label">{label}</div>
+        if st.button("Continue →", type="primary", use_container_width=True, key="patient_continue"):
+            pname = pname.strip()
+            if not pname:
+                st.error("Please enter the patient name.")
+            else:
+                st.session_state.patient_name = pname
+                st.session_state.scores = {"speech": None, "hw": None, "eeg": None}
+                st.session_state.selected_modalities = []
+                st.session_state.screening_mode = None
+                st.session_state.last_result = None
+                go("mode_select")
+
+
+# ═══════════════════════════════════════════════════════════
+# MODE SELECTION
+# ═══════════════════════════════════════════════════════════
+def show_mode_select():
+    render_topbar()
+
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-header-icon">🧪</div>
+        <div>
+            <h1>Choose Screening Type</h1>
+            <p>Select based on the test data available for the patient</p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("""
+        <div class="choice-card">
+            <div class="choice-icon">🔹</div>
+            <div class="choice-title">Singular Model</div>
+            <div class="choice-desc">
+                Choose this when you have test data for only one modality.
             </div>
-            """, unsafe_allow_html=True)
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Select Singular Model →", use_container_width=True, type="primary", key="choose_single"):
+            st.session_state.screening_mode = "single"
+            st.session_state.selected_modalities = []
+            st.session_state.scores = {"speech": None, "hw": None, "eeg": None}
+            go("modality_select")
 
-    st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
-    st.markdown("#### Select a Screening Test")
+    with c2:
+        st.markdown("""
+        <div class="choice-card">
+            <div class="choice-icon">🔀</div>
+            <div class="choice-title">Cross Modalities</div>
+            <div class="choice-desc">
+                Choose this when you have test data for more than one modality.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Select Cross Modalities →", use_container_width=True, type="primary", key="choose_cross"):
+            st.session_state.screening_mode = "cross"
+            st.session_state.selected_modalities = []
+            st.session_state.scores = {"speech": None, "hw": None, "eeg": None}
+            go("modality_select")
 
-    # Modality cards
-    c1, c2, c3 = st.columns(3)
+    st.markdown("---")
+    if st.button("← Back to Patient Name", key="mode_back"):
+        go("patient_start")
+
+
+# ═══════════════════════════════════════════════════════════
+# MODALITY SELECTION
+# ═══════════════════════════════════════════════════════════
+def show_modality_select():
+    render_topbar()
+
+    mode = st.session_state.screening_mode
+    if mode not in ["single", "cross"]:
+        st.warning("Please choose a screening type first.")
+        if st.button("Go to Screening Type"):
+            go("mode_select")
+        return
+
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-header-icon">✅</div>
+        <div>
+            <h1>Select Available Test Data</h1>
+            <p>Only the selected modalities will be shown for testing</p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
     modalities = [
-        (c1, "speech",      "speech", "🎙️", "Speech Analysis",
-         "Analyse voice biomarkers including jitter, shimmer, HNR, and MFCC features.",
-         "Upload CSV"),
-        (c2, "handwriting", "hw",     "✍️", "Handwriting Analysis",
-         "Detect motor control abnormalities from spiral or wave drawing images.",
-         "Upload Image"),
-        (c3, "eeg",         "eeg",    "🧠", "EEG Analysis",
-         "Screen brainwave patterns for Parkinson's-related neural signatures.",
-         "Upload ZIP"),
+        ("speech", "🎙️", "Speech Analysis", "CSV voice features"),
+        ("handwriting", "✍️", "Handwriting Analysis", "Spiral/wave image"),
+        ("eeg", "🧠", "EEG Analysis", "BIDS ZIP with .set file"),
     ]
-    for col, page_key, score_key, icon, title, desc, action in modalities:
-        with col:
-            badge = (f'<span class="modality-badge badge-done">✓ Score: {scores[score_key]:.3f}</span>'
-                     if scores[score_key] is not None
-                     else f'<span class="modality-badge badge-pending">Pending</span>')
-            st.markdown(f"""
-            <div class="modality-card">
-                <div class="modality-icon">{icon}</div>
-                <div class="modality-title">{title}</div>
-                <div class="modality-desc">{desc}</div>
-                {badge}
-            </div>
-            """, unsafe_allow_html=True)
-            if st.button(f"{action} →", key=f"go_{page_key}", use_container_width=True):
-                if not st.session_state.patient_name:
-                    st.warning("Please enter a patient name first.")
-                else:
-                    go(page_key)
 
-    # Fuse button if any scores exist
-    if done > 0:
-        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-        st.markdown("---")
-        col_l, col_m, col_r = st.columns([1, 2, 1])
-        with col_m:
-            st.markdown(f"""
-            <div style="text-align:center;margin-bottom:0.75rem;">
-                <span style="font-size:0.85rem;color:#6B7A99;">
-                    {done}/3 test(s) complete · Fused score uses available results
-                </span>
-            </div>
-            """, unsafe_allow_html=True)
-            if st.button("⚡ Calculate Fused Risk Score →",
-                         use_container_width=True, type="primary", key="home_fuse"):
-                go("fuse")
+    if mode == "single":
+        selected = st.radio(
+            "Select one modality",
+            options=["speech", "handwriting", "eeg"],
+            format_func=lambda x: f"{modality_icon(x)} {modality_label(x)}",
+            horizontal=True,
+            key="single_modality_radio"
+        )
+
+        c1, c2, c3 = st.columns(3)
+        for col, (key, icon, title, desc) in zip([c1, c2, c3], modalities):
+            with col:
+                st.markdown(f"""
+                <div class="modality-card">
+                    <div class="modality-icon">{icon}</div>
+                    <div class="modality-title">{title}</div>
+                    <div class="modality-desc">{desc}</div>
+                    <span class="modality-badge {'badge-done' if selected == key else 'badge-pending'}">
+                        {'Selected' if selected == key else 'Available'}
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
+
+        if st.button("Start Testing →", type="primary", use_container_width=True, key="start_single"):
+            st.session_state.selected_modalities = [selected]
+            st.session_state.scores = {"speech": None, "hw": None, "eeg": None}
+            go(selected)
+
+    else:
+        st.markdown("""
+        <div class="info-box">
+            Select at least two modalities for cross-modal screening.
+        </div>
+        """, unsafe_allow_html=True)
+
+        c1, c2, c3 = st.columns(3)
+        chosen = []
+        for col, (key, icon, title, desc) in zip([c1, c2, c3], modalities):
+            with col:
+                checked = st.checkbox(f"{icon} {title}", key=f"cross_check_{key}")
+                st.markdown(f"""
+                <div class="modality-card">
+                    <div class="modality-icon">{icon}</div>
+                    <div class="modality-title">{title}</div>
+                    <div class="modality-desc">{desc}</div>
+                    <span class="modality-badge {'badge-done' if checked else 'badge-pending'}">
+                        {'Selected' if checked else 'Not selected'}
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
+                if checked:
+                    chosen.append(key)
+
+        if st.button("Start Selected Tests →", type="primary", use_container_width=True, key="start_cross"):
+            if len(chosen) < 2:
+                st.error("Please select at least two modalities for cross-modal screening.")
+            else:
+                st.session_state.selected_modalities = chosen
+                st.session_state.scores = {"speech": None, "hw": None, "eeg": None}
+                go(chosen[0])
+
+    st.markdown("---")
+    if st.button("← Back to Screening Type", key="select_back"):
+        go("mode_select")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -855,6 +1172,12 @@ def show_speech():
     </div>
     """, unsafe_allow_html=True)
 
+    if "speech" not in st.session_state.selected_modalities:
+        st.warning("Speech was not selected for this screening session.")
+        if st.button("Back to selected tests"):
+            go("modality_select")
+        return
+
     tab1, tab2 = st.tabs(["  📁 Upload CSV  ", "  ✏️ Enter Manually  "])
 
     with tab1:
@@ -865,10 +1188,9 @@ def show_speech():
         </div>
         """, unsafe_allow_html=True)
 
-        uploaded = st.file_uploader("Drop CSV here or click to browse",
-                                    type=["csv"], key="sp_csv")
+        uploaded = st.file_uploader("Drop CSV here or click to browse", type=["csv"], key="sp_csv")
         if uploaded:
-            df  = pd.read_csv(io.BytesIO(uploaded.getvalue()))
+            df = pd.read_csv(io.BytesIO(uploaded.getvalue()))
             row = df.iloc[0].to_dict()
             st.markdown(f"""
             <div style="background:#F0FDF4;border:1px solid #A7F3D0;border-radius:10px;
@@ -884,13 +1206,12 @@ def show_speech():
 
             if st.button("Run Speech Analysis →", type="primary", key="sp_csv_btn"):
                 with st.spinner("Analysing…"):
-                    res = requests.post(f"{BASE_URL}/analyze/speech",
-                                        json=row, headers=auth_header())
+                    res = requests.post(f"{BASE_URL}/analyze/speech", json=row, headers=auth_header())
                 if res.status_code == 200:
                     d = res.json()
                     st.session_state.scores["speech"] = d["p_pd"]
                     render_risk_result(d["p_pd"], d["risk"], "Speech — PD Probability")
-                    st.success("Score saved to session. Return to Dashboard to continue.")
+                    st.success("Speech score saved for this session.")
                 else:
                     st.error(f"Analysis failed: {res.text}")
 
@@ -913,24 +1234,24 @@ def show_speech():
         cols = st.columns(3)
         for i, f in enumerate(features):
             with cols[i % 3]:
-                vals[f] = st.number_input(f, value=0.0, format="%.6f",
-                                          key=f"sp_man_{f}")
+                vals[f] = st.number_input(f, value=0.0, format="%.6f", key=f"sp_man_{f}")
 
         if st.button("Run Speech Analysis →", type="primary", key="sp_man_btn"):
             with st.spinner("Analysing…"):
-                res = requests.post(f"{BASE_URL}/analyze/speech",
-                                    json=vals, headers=auth_header())
+                res = requests.post(f"{BASE_URL}/analyze/speech", json=vals, headers=auth_header())
             if res.status_code == 200:
                 d = res.json()
                 st.session_state.scores["speech"] = d["p_pd"]
                 render_risk_result(d["p_pd"], d["risk"], "Speech — PD Probability")
-                st.success("Score saved to session. Return to Dashboard to continue.")
+                st.success("Speech score saved for this session.")
             else:
                 st.error(f"Analysis failed: {res.text}")
 
+    render_saved_score_continue("speech")
+
     st.markdown("---")
-    if st.button("← Back to Dashboard", key="sp_back"):
-        go("home")
+    if st.button("← Back to Selected Tests", key="sp_back"):
+        go("modality_select")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -950,6 +1271,12 @@ def show_handwriting():
     </div>
     """, unsafe_allow_html=True)
 
+    if "handwriting" not in st.session_state.selected_modalities:
+        st.warning("Handwriting was not selected for this screening session.")
+        if st.button("Back to selected tests"):
+            go("modality_select")
+        return
+
     st.markdown("""
     <div class="info-box">
         Upload a JPG or PNG of the patient's handwriting sample (spiral/wave test).
@@ -959,8 +1286,7 @@ def show_handwriting():
 
     col1, col2 = st.columns([1.4, 1])
     with col1:
-        uploaded = st.file_uploader("Drop image here or click to browse",
-                                    type=["jpg", "jpeg", "png"], key="hw_img")
+        uploaded = st.file_uploader("Drop image here or click to browse", type=["jpg", "jpeg", "png"], key="hw_img")
     with col2:
         if uploaded:
             st.image(uploaded, caption="Uploaded image", use_container_width=True)
@@ -977,13 +1303,15 @@ def show_handwriting():
                 d = res.json()
                 st.session_state.scores["hw"] = d["p_pd"]
                 render_risk_result(d["p_pd"], d["risk"], "Handwriting — PD Probability")
-                st.success("Score saved to session. Return to Dashboard to continue.")
+                st.success("Handwriting score saved for this session.")
             else:
                 st.error(f"Analysis failed: {res.text}")
 
+    render_saved_score_continue("handwriting")
+
     st.markdown("---")
-    if st.button("← Back to Dashboard", key="hw_back"):
-        go("home")
+    if st.button("← Back to Selected Tests", key="hw_back"):
+        go("modality_select")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1003,6 +1331,12 @@ def show_eeg():
     </div>
     """, unsafe_allow_html=True)
 
+    if "eeg" not in st.session_state.selected_modalities:
+        st.warning("EEG was not selected for this screening session.")
+        if st.button("Back to selected tests"):
+            go("modality_select")
+        return
+
     st.markdown("""
     <div class="info-box">
         Upload a ZIP file containing the EEG recording in EEGLAB format (.set file inside).
@@ -1010,8 +1344,7 @@ def show_eeg():
     </div>
     """, unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("Drop ZIP here or click to browse",
-                                type=["zip"], key="eeg_zip")
+    uploaded = st.file_uploader("Drop ZIP here or click to browse", type=["zip"], key="eeg_zip")
     if uploaded:
         st.markdown(f"""
         <div style="background:#F0FDF4;border:1px solid #A7F3D0;border-radius:10px;
@@ -1024,9 +1357,7 @@ def show_eeg():
             with st.spinner("Processing EEG data… this may take a moment"):
                 res = requests.post(
                     f"{BASE_URL}/analyze/eeg",
-                    files={"eeg_zip": (uploaded.name,
-                                       uploaded.getvalue(),
-                                       "application/zip")},
+                    files={"eeg_zip": (uploaded.name, uploaded.getvalue(), "application/zip")},
                     headers=auth_header()
                 )
             if res.status_code == 200:
@@ -1039,13 +1370,15 @@ def show_eeg():
                         Analysed across {d['n_segs']} EEG segments · Model: {d.get('model','—')}
                     </div>
                     """, unsafe_allow_html=True)
-                st.success("Score saved to session. Return to Dashboard to continue.")
+                st.success("EEG score saved for this session.")
             else:
                 st.error(f"Analysis failed: {res.text}")
 
+    render_saved_score_continue("eeg")
+
     st.markdown("---")
-    if st.button("← Back to Dashboard", key="eeg_back"):
-        go("home")
+    if st.button("← Back to Selected Tests", key="eeg_back"):
+        go("modality_select")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1055,17 +1388,19 @@ def show_fuse():
     render_topbar()
     render_progress()
 
-    st.markdown("""
+    assessment_title = "Final Risk Assessment" if st.session_state.screening_mode == "single" else "Fused Risk Assessment"
+    assessment_subtitle = "Final result using the selected modality score" if st.session_state.screening_mode == "single" else "Combined risk evaluation using selected available modality scores"
+
+    st.markdown(f"""
     <div class="page-header">
         <div class="page-header-icon">⚡</div>
         <div>
-            <h1>Fused Risk Assessment</h1>
-            <p>Weighted combination of available modality scores (1–3 tests)</p>
+            <h1>{assessment_title}</h1>
+            <p>{assessment_subtitle}</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Helper: compute fused score locally from whatever scores exist ──
     WEIGHTS = {"speech": 0.30, "hw": 0.25, "eeg": 0.45}
 
     def local_fuse(sc):
@@ -1082,103 +1417,144 @@ def show_fuse():
             risk = "Low Risk"
         return fused, risk
 
-    # ── If we just saved a result, show it immediately (scores already cleared) ──
     if st.session_state.last_result:
-        d     = st.session_state.last_result
+        d = st.session_state.last_result
         fused = d.get("fused_score")
-        risk  = d.get("risk")
-
-        # Show the scores that were used (stored alongside result)
+        risk = d.get("risk")
         saved_scores = d.get("used_scores", {})
-        if saved_scores:
-            col1, col2, col3 = st.columns(3)
-            modal_info = [
-                (col1, "speech", "🎙️", "Speech"),
-                (col2, "hw",     "✍️", "Handwriting"),
-                (col3, "eeg",    "🧠", "EEG"),
-            ]
-            available_keys = [k for k in WEIGHTS if saved_scores.get(k) is not None]
-            raw_total = sum(WEIGHTS[k] for k in available_keys) if available_keys else 1
-            for col, key, icon, label in modal_info:
-                with col:
-                    val   = saved_scores.get(key)
-                    base_w = int(WEIGHTS[key] * 100)
-                    eff_w  = int(WEIGHTS[key] / raw_total * 100)
-                    if val is not None:
-                        colour = "#DC2626" if val >= 0.65 else "#D97706" if val >= 0.40 else "#059669"
-                        wlabel = f"Effective weight: {eff_w}%" if len(available_keys) < 3 else f"Weight: {base_w}%"
-                        st.markdown(f"""
-                        <div class="ns-card" style="text-align:center;">
-                            <div style="font-size:1.5rem">{icon}</div>
-                            <div style="font-size:0.78rem;color:#6B7A99;font-weight:500;
-                                        text-transform:uppercase;letter-spacing:0.06em;margin:0.4rem 0;">{label}</div>
-                            <div style="font-size:1.75rem;font-weight:700;font-family:'DM Mono',monospace;color:{colour};">{val:.3f}</div>
-                            <div style="font-size:0.72rem;color:#9CA3AF;margin-top:0.25rem;">{wlabel}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""
-                        <div class="ns-card" style="text-align:center;opacity:0.45;">
-                            <div style="font-size:1.5rem">{icon}</div>
-                            <div style="font-size:0.78rem;color:#6B7A99;font-weight:500;
-                                        text-transform:uppercase;letter-spacing:0.06em;margin:0.4rem 0;">{label}</div>
-                            <div style="font-size:1.1rem;color:#9CA3AF;">Not tested</div>
-                            <div style="font-size:0.72rem;color:#9CA3AF;margin-top:0.25rem;">Skipped</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-            st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
-        render_risk_result(fused, risk, "Fused Risk Score")
+        show_score_summary(saved_scores, WEIGHTS)
+        render_risk_result(fused, risk, "Final Risk Score" if st.session_state.screening_mode == "single" else "Fused Risk Score")
         st.markdown(f"""
         <div style="text-align:center;font-size:0.82rem;color:#6B7A99;margin-top:0.5rem;">
-            Record saved · Patient: <b>{d.get('patient_name','—')}</b> · ID: {d.get('patient_id','—')}
+            Results saved · Patient: <b>{d.get('patient_name','—')}</b> · ID: {d.get('patient_id','—') or '—'}
         </div>
         """, unsafe_allow_html=True)
 
         st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("🔄 Start New Patient", use_container_width=True, key="fuse_new"):
-                st.session_state.last_result = None
-                go("home")
+            if st.button("🔄 Start New Screening", use_container_width=True, key="fuse_new"):
+                reset_patient_session(clear_last_result=True)
+                go("patient_start")
         with col_b:
-            if st.button("📋 View History", use_container_width=True, key="fuse_hist"):
-                st.session_state.last_result  = None
-                st.session_state.history_cache = None
-                go("history")
-        st.markdown("---")
-        if st.button("← Back to Dashboard", key="fuse_back"):
-            go("home")
-        return   # ← stop here; nothing else to render
-
-    # ── Normal pre-submission flow ──
-    scores = st.session_state.scores
-    pname  = st.session_state.patient_name
-
-    done = sum(1 for v in scores.values() if v is not None)
-
-    if done == 0:
-        st.warning("No test scores available. Please run at least one screening test first.")
-        if st.button("← Back to Dashboard", key="fuse_back_empty"):
-            go("home")
+            if st.session_state.history_exists:
+                if st.button("📋 View History", use_container_width=True, key="fuse_hist"):
+                    st.session_state.last_result = None
+                    go("history")
         return
 
-    # Score summary cards
-    available_keys = [k for k in WEIGHTS if scores.get(k) is not None]
-    raw_total = sum(WEIGHTS[k] for k in available_keys)
+    selected = st.session_state.selected_modalities
+    if not selected:
+        st.warning("No modalities selected. Please select the available test data first.")
+        if st.button("Go to modality selection"):
+            go("modality_select")
+        return
+
+    scores = st.session_state.scores
+    selected_score_keys = [score_key_for_modality(m) for m in selected]
+    available_selected = {k: scores.get(k) for k in selected_score_keys if scores.get(k) is not None}
+
+    if not available_selected:
+        st.warning("No test scores available. Please run at least one selected screening test first.")
+        if st.button("Back to Selected Tests"):
+            go("modality_select")
+        return
+
+    if not selected_tests_complete():
+        st.info("Some selected tests are still pending. You can still preview the available result, but complete all selected tests before saving.")
+        nxt = next_uncompleted_modality()
+        if nxt and st.button(f"Continue pending test: {modality_icon(nxt)} {modality_label(nxt)}", type="primary"):
+            go(nxt)
+
+    show_score_summary(scores, WEIGHTS)
+
+    fused_preview, risk_preview = local_fuse({k: scores.get(k) for k in selected_score_keys})
+    if fused_preview is not None:
+        preview_label = "Preview — Final Score" if st.session_state.screening_mode == "single" else "Preview — Fused Score"
+        render_risk_result(fused_preview, risk_preview, preview_label)
+
+    st.markdown(f"""
+    <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;
+                padding:0.75rem 1rem;font-size:0.88rem;color:#1E40AF;margin-bottom:1rem;">
+        👤 Patient: <b>{st.session_state.patient_name}</b>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_l, col_m, col_r = st.columns([1, 2, 1])
+    with col_m:
+        if st.button("💾 Save the results →", use_container_width=True, type="primary", key="fuse_btn"):
+            if not selected_tests_complete():
+                st.error("Please complete all selected modalities before saving the results.")
+            elif not st.session_state.patient_name:
+                st.error("Patient name is missing.")
+            else:
+                snapshot_scores = {
+                    "speech": scores.get("speech") if "speech" in selected_score_keys else None,
+                    "hw": scores.get("hw") if "hw" in selected_score_keys else None,
+                    "eeg": scores.get("eeg") if "eeg" in selected_score_keys else None,
+                }
+                snapshot_pname = st.session_state.patient_name
+                fused_val, risk_val = local_fuse({k: v for k, v in snapshot_scores.items() if v is not None})
+
+                saved_pid = None
+                try:
+                    with st.spinner("Saving the results…"):
+                        res = requests.post(
+                            f"{BASE_URL}/analyze/fuse",
+                            json={"patient_name": snapshot_pname, "scores": snapshot_scores},
+                            headers=auth_header(),
+                            timeout=15
+                        )
+                    if res.status_code == 200:
+                        d = res.json()
+                        saved_pid = d.get("patient_id")
+                        fused_val = d.get("fused_score", fused_val)
+                        risk_val = d.get("risk", risk_val)
+                    else:
+                        st.error(f"Could not save the results: {res.text}")
+                        return
+                except Exception as e:
+                    st.error(f"Could not save the results: {e}")
+                    return
+
+                st.session_state.last_result = {
+                    "fused_score": fused_val,
+                    "risk": risk_val,
+                    "patient_name": snapshot_pname,
+                    "patient_id": saved_pid,
+                    "used_scores": snapshot_scores,
+                }
+                st.session_state.history_cache = None
+                refresh_history_exists()
+                st.rerun()
+
+    st.markdown("---")
+    if st.button("← Back to Selected Tests", key="fuse_back"):
+        go("modality_select")
+
+
+def show_score_summary(scores, weights):
+    selected = st.session_state.selected_modalities
+    selected_keys = [score_key_for_modality(m) for m in selected]
+    available_keys = [k for k in selected_keys if scores.get(k) is not None]
+    raw_total = sum(weights[k] for k in available_keys) if available_keys else 1
 
     col1, col2, col3 = st.columns(3)
     modal_info = [
         (col1, "speech", "🎙️", "Speech"),
-        (col2, "hw",     "✍️", "Handwriting"),
-        (col3, "eeg",    "🧠", "EEG"),
+        (col2, "hw", "✍️", "Handwriting"),
+        (col3, "eeg", "🧠", "EEG"),
     ]
+
     for col, key, icon, label in modal_info:
         with col:
-            val    = scores.get(key)
-            base_w = int(WEIGHTS[key] * 100)
-            eff_w  = int(WEIGHTS[key] / raw_total * 100)
-            if val is not None:
+            val = scores.get(key)
+            base_w = int(weights[key] * 100)
+            eff_w = int(weights[key] / raw_total * 100) if key in available_keys else 0
+            selected_display = key in selected_keys
+
+            if selected_display and val is not None:
                 colour = "#DC2626" if val >= 0.65 else "#D97706" if val >= 0.40 else "#059669"
                 wlabel = f"Effective weight: {eff_w}%" if len(available_keys) < 3 else f"Weight: {base_w}%"
                 st.markdown(f"""
@@ -1190,87 +1566,26 @@ def show_fuse():
                     <div style="font-size:0.72rem;color:#9CA3AF;margin-top:0.25rem;">{wlabel}</div>
                 </div>
                 """, unsafe_allow_html=True)
-            else:
+            elif selected_display:
                 st.markdown(f"""
-                <div class="ns-card" style="text-align:center;opacity:0.45;">
+                <div class="ns-card" style="text-align:center;opacity:0.55;">
                     <div style="font-size:1.5rem">{icon}</div>
                     <div style="font-size:0.78rem;color:#6B7A99;font-weight:500;
                                 text-transform:uppercase;letter-spacing:0.06em;margin:0.4rem 0;">{label}</div>
-                    <div style="font-size:1.1rem;color:#9CA3AF;">Not tested</div>
-                    <div style="font-size:0.72rem;color:#9CA3AF;margin-top:0.25rem;">Base weight: {base_w}% (skipped)</div>
+                    <div style="font-size:1.1rem;color:#9CA3AF;">Pending</div>
+                    <div style="font-size:0.72rem;color:#9CA3AF;margin-top:0.25rem;">Selected</div>
                 </div>
                 """, unsafe_allow_html=True)
-
-    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-
-    # ── Live preview of fused score ──
-    fused_preview, risk_preview = local_fuse(scores)
-    if fused_preview is not None:
-        st.markdown("<div style='margin-bottom:0.5rem;'></div>", unsafe_allow_html=True)
-        render_risk_result(fused_preview, risk_preview, f"Preview — Fused Score ({done}/3 tests)")
-
-    # Patient confirmation
-    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-    if not pname:
-        new_pname = st.text_input("Patient Name (required to save)",
-                                  placeholder="Enter patient name…",
-                                  key="fuse_pname")
-        if new_pname:
-            st.session_state.patient_name = new_pname
-    else:
-        st.markdown(f"""
-        <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;
-                    padding:0.75rem 1rem;font-size:0.88rem;color:#1E40AF;margin-bottom:1rem;">
-            👤 Patient: <b>{pname}</b>
-        </div>
-        """, unsafe_allow_html=True)
-
-    col_l, col_m, col_r = st.columns([1, 2, 1])
-    with col_m:
-        if st.button("💾 Save Result →",
-                     use_container_width=True, type="primary", key="fuse_btn"):
-            if not st.session_state.patient_name:
-                st.error("Please enter a patient name before saving.")
             else:
-                # Snapshot scores and patient name BEFORE clearing
-                snapshot_scores  = dict(scores)
-                snapshot_pname   = st.session_state.patient_name
-                fused_val, risk_val = local_fuse(snapshot_scores)
-
-                # Try to save to backend; if it fails, still show local result
-                saved_pid = None
-                try:
-                    with st.spinner("Saving…"):
-                        res = requests.post(
-                            f"{BASE_URL}/analyze/fuse",
-                            json={"patient_name": snapshot_pname,
-                                  "scores": snapshot_scores},
-                            headers=auth_header(),
-                            timeout=8
-                        )
-                    if res.status_code == 200:
-                        d = res.json()
-                        saved_pid  = d.get("patient_id")
-                        fused_val  = d.get("fused_score", fused_val)
-                        risk_val   = d.get("risk", risk_val)
-                except Exception:
-                    pass  # backend down — still show local result
-
-                st.session_state.last_result = {
-                    "fused_score":  fused_val,
-                    "risk":         risk_val,
-                    "patient_name": snapshot_pname,
-                    "patient_id":   saved_pid,
-                    "used_scores":  snapshot_scores,
-                }
-                # Now safe to clear for next patient
-                st.session_state.scores       = {"speech": None, "hw": None, "eeg": None}
-                st.session_state.patient_name = ""
-                st.rerun()
-
-    st.markdown("---")
-    if st.button("← Back to Dashboard", key="fuse_back"):
-        go("home")
+                st.markdown(f"""
+                <div class="ns-card" style="text-align:center;opacity:0.35;">
+                    <div style="font-size:1.5rem">{icon}</div>
+                    <div style="font-size:0.78rem;color:#6B7A99;font-weight:500;
+                                text-transform:uppercase;letter-spacing:0.06em;margin:0.4rem 0;">{label}</div>
+                    <div style="font-size:1.1rem;color:#9CA3AF;">Not selected</div>
+                    <div style="font-size:0.72rem;color:#9CA3AF;margin-top:0.25rem;">Skipped</div>
+                </div>
+                """, unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1284,26 +1599,21 @@ def show_history():
         <div class="page-header-icon">📋</div>
         <div>
             <h1>Patient History</h1>
-            <p>All screening records for your account</p>
+            <p>All screening records saved under your account</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    col_refresh, _ = st.columns([1, 4])
-    with col_refresh:
-        if st.button("🔄 Refresh", key="hist_refresh"):
-            st.session_state.history_cache = None
-
     if st.session_state.history_cache is None:
         with st.spinner("Loading records…"):
-            res = requests.get(f"{BASE_URL}/history/all/mine",
-                               headers=auth_header())
+            res = requests.get(f"{BASE_URL}/history/all/mine", headers=auth_header())
         if res.status_code == 200:
             st.session_state.history_cache = res.json()
+            st.session_state.history_exists = bool(st.session_state.history_cache)
         else:
             st.error("Could not fetch history.")
-            if st.button("← Back to Dashboard"):
-                go("home")
+            if st.button("← Back to New Screening"):
+                go("patient_start")
             return
 
     records = st.session_state.history_cache
@@ -1314,24 +1624,23 @@ def show_history():
             <div style="font-size:2.5rem;margin-bottom:1rem;">📭</div>
             <div style="font-weight:600;font-size:1rem;">No records yet</div>
             <div style="font-size:0.85rem;margin-top:0.5rem;">
-                Complete a screening and save a result to see it here.
+                Complete a screening and save the results to see them here.
             </div>
         </div>
         """, unsafe_allow_html=True)
     else:
-        # Summary stats
         total = len(records)
         all_results = [r for rec in records for r in rec.get("screening_results", [])]
-        high   = sum(1 for r in all_results if r.get("risk_label") == "High Risk")
-        mod    = sum(1 for r in all_results if r.get("risk_label") == "Moderate Risk")
-        low    = sum(1 for r in all_results if r.get("risk_label") == "Low Risk")
+        high = sum(1 for r in all_results if r.get("risk_label") == "High Risk")
+        mod = sum(1 for r in all_results if r.get("risk_label") == "Moderate Risk")
+        low = sum(1 for r in all_results if r.get("risk_label") == "Low Risk")
 
         c1, c2, c3, c4 = st.columns(4)
         for col, num, label in [
             (c1, total, "Total Patients"),
-            (c2, high,  "High Risk"),
-            (c3, mod,   "Moderate Risk"),
-            (c4, low,   "Low Risk"),
+            (c2, high, "High Risk"),
+            (c3, mod, "Moderate Risk"),
+            (c4, low, "Low Risk"),
         ]:
             with col:
                 st.markdown(f"""
@@ -1343,27 +1652,23 @@ def show_history():
 
         st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
 
-        # Search
-        search = st.text_input("🔍 Search by patient name",
-                               placeholder="Type to filter…", key="hist_search")
-
-        filtered = [r for r in records
-                    if search.lower() in r.get("patient_name", "").lower()]
+        search = st.text_input("🔍 Search by patient name", placeholder="Type to filter…", key="hist_search")
+        filtered = [r for r in records if search.lower() in r.get("patient_name", "").lower()]
 
         if not filtered:
             st.info("No records match your search.")
         else:
             for rec in filtered:
-                pname   = rec.get("patient_name", "Unknown")
-                date    = rec.get("created_at", "")[:10] if rec.get("created_at") else "—"
+                pname = rec.get("patient_name", "Unknown")
+                date = rec.get("created_at", "")[:10] if rec.get("created_at") else "—"
                 results = rec.get("screening_results", [])
 
                 with st.expander(f"👤  {pname}   ·   {date}   ·   {len(results)} result(s)"):
                     if not results:
                         st.write("No results recorded.")
                     for i, r in enumerate(results):
-                        fused  = r.get("fused_score")
-                        risk   = r.get("risk_label", "—")
+                        fused = r.get("fused_score")
+                        risk = r.get("risk_label", "—")
                         risk_cls = {
                             "High Risk": "risk-high",
                             "Moderate Risk": "risk-moderate",
@@ -1372,36 +1677,36 @@ def show_history():
 
                         col1, col2, col3 = st.columns([2, 2, 1])
                         with col1:
-                            eeg  = r.get("eeg_score")
-                            sp   = r.get("speech_score")
-                            hw   = r.get("hw_score")
+                            eeg = r.get("eeg_score")
+                            sp = r.get("speech_score")
+                            hw = r.get("hw_score")
                             st.markdown(f"""
                             <div style="font-size:0.83rem;">
-                                <span class="score-pill">🧠 EEG: {f"{eeg:.3f}" if eeg else "—"}</span>&nbsp;
-                                <span class="score-pill">🎙️ Speech: {f"{sp:.3f}" if sp else "—"}</span>&nbsp;
-                                <span class="score-pill">✍️ HW: {f"{hw:.3f}" if hw else "—"}</span>
+                                <span class="score-pill">🧠 EEG: {f"{eeg:.3f}" if eeg is not None else "—"}</span>&nbsp;
+                                <span class="score-pill">🎙️ Speech: {f"{sp:.3f}" if sp is not None else "—"}</span>&nbsp;
+                                <span class="score-pill">✍️ HW: {f"{hw:.3f}" if hw is not None else "—"}</span>
                             </div>
                             """, unsafe_allow_html=True)
                         with col2:
                             if fused is not None:
                                 st.markdown(f"""
                                 <div style="font-size:0.83rem;">
-                                    Fused score:&nbsp;
+                                    Final score:&nbsp;
                                     <span style="font-family:'DM Mono',monospace;font-weight:700;">
                                         {fused:.4f}
                                     </span>
                                 </div>
                                 """, unsafe_allow_html=True)
                         with col3:
-                            st.markdown(f'<div class="{risk_cls}" style="font-size:0.78rem;">{risk}</div>',
-                                        unsafe_allow_html=True)
+                            st.markdown(f'<div class="{risk_cls}" style="font-size:0.78rem;">{risk}</div>', unsafe_allow_html=True)
 
                         if i < len(results) - 1:
                             st.divider()
 
     st.markdown("---")
-    if st.button("← Back to Dashboard", key="hist_back"):
-        go("home")
+    if st.button("← Start New Screening", key="hist_back"):
+        reset_patient_session(clear_last_result=True)
+        go("patient_start")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1410,12 +1715,26 @@ def show_history():
 render_sidebar()
 
 if st.session_state.token is None:
-    show_login()
+    show_auth()
 else:
     page = st.session_state.page
-    if   page == "home":        show_home()
-    elif page == "speech":      show_speech()
-    elif page == "handwriting":  show_handwriting()
-    elif page == "eeg":         show_eeg()
-    elif page == "fuse":        show_fuse()
-    elif page == "history":     show_history()
+    if page in ["auth", "login"]:
+        go("patient_start")
+    elif page == "patient_start":
+        show_patient_start()
+    elif page == "mode_select":
+        show_mode_select()
+    elif page == "modality_select":
+        show_modality_select()
+    elif page == "speech":
+        show_speech()
+    elif page == "handwriting":
+        show_handwriting()
+    elif page == "eeg":
+        show_eeg()
+    elif page == "fuse":
+        show_fuse()
+    elif page == "history":
+        show_history()
+    else:
+        show_patient_start()
